@@ -1,0 +1,14 @@
+name = "soidupaevik-api"
+main = "src/worker.js"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "soidupaevik-db"
+database_id = "e51ac278-ec1c-484b-8c9d-4879af74a484"
+
+[vars]
+# Override these in production with `wrangler secret put`:
+# - JWT_SECRET (random long string for signing tokens)
+# - ALLOWED_ORIGIN (your frontend URL, e.g. https://tarmokouhkna.github.io)
+ALLOWED_ORIGIN = "https://tarmokouhkna.github.io"
