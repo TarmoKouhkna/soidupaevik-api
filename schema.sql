@@ -16,10 +16,24 @@ CREATE TABLE IF NOT EXISTS settings (
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
+-- Vehicles (cars) per user. A report belongs to one vehicle; odometer
+-- continuity is tracked per vehicle, so a mid-month car change is two reports.
+CREATE TABLE IF NOT EXISTS vehicles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  plate TEXT NOT NULL,
+  label TEXT,                            -- optional friendly name e.g. "Tööauto"
+  is_default INTEGER NOT NULL DEFAULT 0,
+  archived INTEGER NOT NULL DEFAULT 0,   -- sold/old car, kept for history
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
 -- Monthly reports
 CREATE TABLE IF NOT EXISTS reports (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
+  vehicle_id INTEGER,
   year INTEGER NOT NULL,
   month INTEGER NOT NULL,
   employee_name TEXT,
@@ -31,8 +45,9 @@ CREATE TABLE IF NOT EXISTS reports (
   route TEXT,
   purpose TEXT,
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-  UNIQUE(user_id, year, month),
-  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  UNIQUE(user_id, year, month, vehicle_id),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE SET NULL
 );
 
 -- Trip dates per report
@@ -57,3 +72,4 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_reports_user ON reports(user_id, year DESC, month DESC);
 CREATE INDEX IF NOT EXISTS idx_trips_report ON trips(report_id);
+CREATE INDEX IF NOT EXISTS idx_vehicles_user ON vehicles(user_id);
