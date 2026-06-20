@@ -8,7 +8,7 @@ database_name = "soidupaevik-db"
 database_id = "e51ac278-ec1c-484b-8c9d-4879af74a484"
 
 [vars]
-# Override these in production with `wrangler secret put`:
-# - JWT_SECRET (random long string for signing tokens)
-# - ALLOWED_ORIGIN (your frontend URL, e.g. https://tarmokouhkna.github.io)
-ALLOWED_ORIGIN = "https://tarmokouhkna.github.io"
+# Frontend origin for CORS. Matches the live site. JWT_SECRET is configured in
+# the Cloudflare dashboard (not here) — always deploy with `--keep-vars` so it
+# is preserved and existing user sessions are not invalidated.
+ALLOWED_ORIGIN = "https://soidud.org"
