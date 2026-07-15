@@ -27,6 +27,12 @@
  *
  *   GET    /api/admin/users
  *   DELETE /api/admin/users/:id
+ *
+ *   GET    /api/fuel-prices          (public — Estonia national-average 95 & diesel)
+ *   PUT    /api/fuel-prices          (admin — manual override / clear)
+ *
+ * Cron (wrangler.toml [triggers]): daily refresh of fuel prices from
+ * globalpetrolprices.com, unless an admin override is active.
  */
 
 const JWT_EXPIRY_DAYS = 30;
@@ -461,6 +467,86 @@ async function handleAdminDeleteUser(id, user, env) {
 }
 
 // ============================================================
+// Fuel prices (Estonia national average — informational badge)
+// ============================================================
+// Public read: anyone (even logged-out) can see the current prices.
+async function handleGetFuelPrices(env) {
+  const row = await env.DB.prepare(
+    'SELECT petrol_95, diesel, price_date, source, updated_at FROM fuel_prices WHERE id = 1'
+  ).first();
+  return json(row || { petrol_95: null, diesel: null, price_date: null, source: 'auto', updated_at: null });
+}
+
+// Admin write: set a manual override, or clear it back to automatic.
+async function handlePutFuelPrices(req, user, env) {
+  if (user.is_admin !== 1) return json({ error: 'Pole õigust' }, { status: 403 });
+  const body = await req.json().catch(() => ({}));
+
+  // Clear override → the daily cron takes over managing the prices again.
+  if (body.clear === true || body.source === 'auto') {
+    await env.DB.prepare(
+      "UPDATE fuel_prices SET source = 'auto', updated_at = datetime('now') WHERE id = 1"
+    ).run();
+    return json({ ok: true, source: 'auto' });
+  }
+
+  const p95 = parseFloat(body.petrol_95);
+  const die = parseFloat(body.diesel);
+  if (![p95, die].every(v => Number.isFinite(v) && v > 0 && v < 10))
+    return json({ error: 'Vigased hinnad' }, { status: 400 });
+
+  const today = new Date().toISOString().slice(0, 10);
+  await env.DB.prepare(
+    `UPDATE fuel_prices
+       SET petrol_95 = ?, diesel = ?, price_date = ?, source = 'manual', updated_at = datetime('now')
+     WHERE id = 1`
+  ).bind(p95, die, today).run();
+  return json({ ok: true, source: 'manual' });
+}
+
+// Fetch Estonia's national-average price for one fuel type from the public
+// globalpetrolprices.com page. The page contains a sentence like
+//   "... in Estonia is  EUR 1.68 per liter ..."
+// and a date range "... to 2026-07-06." whose end date we use as the "as of".
+// Returns { price, date } or null if the page can't be fetched/parsed.
+async function fetchGppPrice(fuelPath) {
+  const res = await fetch(`https://www.globalpetrolprices.com/Estonia/${fuelPath}/`, {
+    headers: { 'user-agent': 'Mozilla/5.0 (compatible; SoidupaevikBot/1.0; +https://soidud.org)' },
+    cf: { cacheTtl: 3600, cacheEverything: true },
+  });
+  if (!res.ok) return null;
+  const html = await res.text();
+  const priceMatch = html.match(/Estonia is\s+EUR\s+([0-9]+\.[0-9]+)\s+per liter/i);
+  if (!priceMatch) return null;
+  const price = parseFloat(priceMatch[1]);
+  if (!Number.isFinite(price) || price <= 0 || price > 10) return null;
+  const dateMatch = html.match(/to\s+(\d{4}-\d{2}-\d{2})\./);
+  return { price, date: dateMatch ? dateMatch[1] : new Date().toISOString().slice(0, 10) };
+}
+
+// Daily cron: refresh the automatic prices, unless an admin override is active.
+// On any fetch/parse failure we keep the last known values (never blank them).
+async function refreshFuelPrices(env) {
+  const current = await env.DB.prepare('SELECT source FROM fuel_prices WHERE id = 1').first();
+  if (current && current.source === 'manual') return; // respect admin override
+
+  const [petrol, diesel] = await Promise.all([
+    fetchGppPrice('gasoline_prices'),
+    fetchGppPrice('diesel_prices'),
+  ]);
+  if (!petrol || !diesel) {
+    console.error('refreshFuelPrices: could not parse prices', { petrol, diesel });
+    return; // keep last known values
+  }
+  const date = petrol.date > diesel.date ? petrol.date : diesel.date;
+  await env.DB.prepare(
+    `UPDATE fuel_prices
+       SET petrol_95 = ?, diesel = ?, price_date = ?, source = 'auto', updated_at = datetime('now')
+     WHERE id = 1`
+  ).bind(petrol.price, diesel.price, date).run();
+}
+
+// ============================================================
 // Router
 // ============================================================
 export default {
@@ -480,6 +566,13 @@ export default {
     }
     return withCors(response, origin);
   },
+
+  // Daily cron (see wrangler.toml [triggers]) — refresh Estonia fuel prices.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(
+      refreshFuelPrices(env).catch(e => console.error('scheduled refreshFuelPrices:', e))
+    );
+  },
 };
 
 async function route(req, url, env) {
@@ -494,6 +587,9 @@ async function route(req, url, env) {
   if (path === '/api/auth/login'    && method === 'POST') return handleLogin(req, env);
   if (path === '/api/auth/logout'   && method === 'POST') return handleLogout();
   if (path === '/api/auth/me'       && method === 'GET')  return handleMe(req, env);
+
+  // Public: current Estonia fuel prices (info badge, visible logged-out too)
+  if (path === '/api/fuel-prices' && method === 'GET') return handleGetFuelPrices(env);
 
   // All other endpoints require JWT
   const user = await getUserFromRequest(req, env);
@@ -521,6 +617,9 @@ async function route(req, url, env) {
     if (method === 'PUT')    return handleUpdateReport(id, req, user, env);
     if (method === 'DELETE') return handleDeleteReport(id, user, env);
   }
+
+  // Admin: manual fuel-price override (set / clear)
+  if (path === '/api/fuel-prices' && method === 'PUT') return handlePutFuelPrices(req, user, env);
 
   if (path === '/api/admin/users' && method === 'GET') return handleAdminListUsers(user, env);
   const adminUserMatch = path.match(/^\/api\/admin\/users\/(\d+)$/);
