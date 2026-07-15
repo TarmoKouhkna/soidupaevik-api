@@ -7,6 +7,10 @@ binding = "DB"
 database_name = "soidupaevik-db"
 database_id = "e51ac278-ec1c-484b-8c9d-4879af74a484"
 
+# Daily refresh of Estonia fuel prices (06:00 UTC). Handler: scheduled() in worker.js.
+[triggers]
+crons = ["0 6 * * *"]
+
 [vars]
 # Frontend origin for CORS. Matches the live site. JWT_SECRET is configured in
 # the Cloudflare dashboard (not here) — always deploy with `--keep-vars` so it
