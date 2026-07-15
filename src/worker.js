@@ -304,12 +304,14 @@ async function handleCreateReport(req, user, env) {
   ).bind(user.id, year, month, vehicleId).first();
   if (existing) return json({ error: 'Selle kuu aruanne on juba olemas', existing_id: existing.id }, { status: 409 });
 
+  const fuelPrice = await resolveFuelPriceForVehicle(vehicleId, user, env);
+
   const result = await env.DB.prepare(
     `INSERT INTO reports
-     (user_id, vehicle_id, year, month, mode, employee_name, plate, employer, prev_speedo, end_speedo, trip_distance, route, purpose, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
+     (user_id, vehicle_id, year, month, mode, employee_name, plate, employer, prev_speedo, end_speedo, trip_distance, route, purpose, fuel_price, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
   ).bind(user.id, vehicleId, year, month, mode, employee_name || null, plate || null, employer || null,
-         prev_speedo || 0, end_speedo || 0, trip_distance || 100, route || null, purpose || null).run();
+         prev_speedo || 0, end_speedo || 0, trip_distance || 100, route || null, purpose || null, fuelPrice).run();
   const reportId = result.meta.last_row_id;
 
   if (Array.isArray(trips) && trips.length) await insertTrips(env, reportId, mode, trips);
@@ -327,12 +329,14 @@ async function handleUpdateReport(id, req, user, env) {
   // Keep the existing vehicle_id when the client omits it (older frontends).
   const vehicleId = body.vehicle_id !== undefined ? body.vehicle_id : owned.vehicle_id;
   const effectiveMode = mode || owned.mode || 'simple';
+  // Re-snapshot the fuel price on save (a save reflects the price at that time).
+  const fuelPrice = await resolveFuelPriceForVehicle(vehicleId, user, env);
   await env.DB.prepare(
     `UPDATE reports SET vehicle_id=?, year=?, month=?, mode=?, employee_name=?, plate=?, employer=?,
-     prev_speedo=?, end_speedo=?, trip_distance=?, route=?, purpose=?, updated_at=datetime('now')
+     prev_speedo=?, end_speedo=?, trip_distance=?, route=?, purpose=?, fuel_price=?, updated_at=datetime('now')
      WHERE id = ?`
   ).bind(vehicleId, year, month, effectiveMode, employee_name || null, plate || null, employer || null,
-         prev_speedo || 0, end_speedo || 0, trip_distance || 100, route || null, purpose || null, id).run();
+         prev_speedo || 0, end_speedo || 0, trip_distance || 100, route || null, purpose || null, fuelPrice, id).run();
 
   if (Array.isArray(trips)) {
     await env.DB.prepare('DELETE FROM trips WHERE report_id = ?').bind(id).run();
@@ -376,6 +380,21 @@ async function resolveDefaultVehicleId(user, env) {
   return def ? def.id : null;
 }
 
+// Snapshot the current fuel price for a vehicle's fuel type, stored on the
+// report at save time. Returns €/liter, or null if the vehicle has no fuel
+// type set or no price is available yet.
+async function resolveFuelPriceForVehicle(vehicleId, user, env) {
+  if (!vehicleId) return null;
+  const veh = await env.DB.prepare(
+    'SELECT fuel_type FROM vehicles WHERE id = ? AND user_id = ?'
+  ).bind(vehicleId, user.id).first();
+  if (!veh || !veh.fuel_type) return null;
+  const fp = await env.DB.prepare('SELECT petrol_95, diesel FROM fuel_prices WHERE id = 1').first();
+  if (!fp) return null;
+  const p = veh.fuel_type === 'diesel' ? fp.diesel : fp.petrol_95;
+  return (p != null && Number.isFinite(p)) ? p : null;
+}
+
 async function handleListVehicles(user, env) {
   const result = await env.DB.prepare(
     `SELECT v.*, COUNT(r.id) AS report_count
@@ -387,11 +406,29 @@ async function handleListVehicles(user, env) {
   return json(result.results || []);
 }
 
+// Validate a fuel type. Returns { ok, value } — value is '95' | 'diesel' | null.
+function parseFuelType(v) {
+  if (v == null || v === '') return { ok: true, value: null };
+  const s = String(v);
+  return (s === '95' || s === 'diesel') ? { ok: true, value: s } : { ok: false };
+}
+// Validate consumption (L/100km). Returns { ok, value } — value is number | null.
+function parseConsumption(v) {
+  if (v == null || v === '') return { ok: true, value: null };
+  const n = parseFloat(v);
+  return (Number.isFinite(n) && n > 0 && n < 100) ? { ok: true, value: n } : { ok: false };
+}
+
 async function handleCreateVehicle(req, user, env) {
   const body = await req.json().catch(() => ({}));
   const plate = (body.plate || '').trim();
   if (!plate) return json({ error: 'Reg. märk on nõutud' }, { status: 400 });
   const label = (body.label || '').trim() || null;
+
+  const ft = parseFuelType(body.fuel_type);
+  if (!ft.ok) return json({ error: 'Kütuse tüüp peab olema 95 või diesel' }, { status: 400 });
+  const fc = parseConsumption(body.fuel_consumption);
+  if (!fc.ok) return json({ error: 'Vigane kütusekulu (L/100km)' }, { status: 400 });
 
   const count = await env.DB.prepare('SELECT COUNT(*) AS n FROM vehicles WHERE user_id = ?').bind(user.id).first();
   // First vehicle, or explicit request, becomes the default.
@@ -399,9 +436,10 @@ async function handleCreateVehicle(req, user, env) {
   if (makeDefault) await env.DB.prepare('UPDATE vehicles SET is_default = 0 WHERE user_id = ?').bind(user.id).run();
 
   const result = await env.DB.prepare(
-    'INSERT INTO vehicles (user_id, plate, label, is_default) VALUES (?, ?, ?, ?)'
-  ).bind(user.id, plate, label, makeDefault).run();
-  return json({ id: result.meta.last_row_id, plate, label, is_default: makeDefault, archived: 0 });
+    'INSERT INTO vehicles (user_id, plate, label, is_default, fuel_type, fuel_consumption) VALUES (?, ?, ?, ?, ?, ?)'
+  ).bind(user.id, plate, label, makeDefault, ft.value, fc.value).run();
+  return json({ id: result.meta.last_row_id, plate, label, is_default: makeDefault, archived: 0,
+                fuel_type: ft.value, fuel_consumption: fc.value });
 }
 
 async function handleUpdateVehicle(id, req, user, env) {
@@ -414,18 +452,29 @@ async function handleUpdateVehicle(id, req, user, env) {
   const plate = body.plate != null ? String(body.plate).trim() : null;
   if (plate === '') return json({ error: 'Reg. märk ei tohi olla tühi' }, { status: 400 });
 
+  const ftPresent = body.fuel_type !== undefined;
+  const ft = ftPresent ? parseFuelType(body.fuel_type) : { ok: true, value: null };
+  if (!ft.ok) return json({ error: 'Kütuse tüüp peab olema 95 või diesel' }, { status: 400 });
+  const fcPresent = body.fuel_consumption !== undefined;
+  const fc = fcPresent ? parseConsumption(body.fuel_consumption) : { ok: true, value: null };
+  if (!fc.ok) return json({ error: 'Vigane kütusekulu (L/100km)' }, { status: 400 });
+
   await env.DB.prepare(
     `UPDATE vehicles SET
-       plate      = COALESCE(?, plate),
-       label      = CASE WHEN ? THEN ? ELSE label END,
-       is_default = CASE WHEN ? THEN 1 ELSE is_default END,
-       archived   = CASE WHEN ? THEN ? ELSE archived END
+       plate            = COALESCE(?, plate),
+       label            = CASE WHEN ? THEN ? ELSE label END,
+       is_default       = CASE WHEN ? THEN 1 ELSE is_default END,
+       archived         = CASE WHEN ? THEN ? ELSE archived END,
+       fuel_type        = CASE WHEN ? THEN ? ELSE fuel_type END,
+       fuel_consumption = CASE WHEN ? THEN ? ELSE fuel_consumption END
      WHERE id = ?`
   ).bind(
     plate,
     body.label !== undefined ? 1 : 0, body.label != null ? String(body.label).trim() || null : null,
     body.is_default ? 1 : 0,
     body.archived !== undefined ? 1 : 0, body.archived ? 1 : 0,
+    ftPresent ? 1 : 0, ft.value,
+    fcPresent ? 1 : 0, fc.value,
     id
   ).run();
   return json({ ok: true });
