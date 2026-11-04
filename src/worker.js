@@ -10,6 +10,7 @@
  *   POST   /api/auth/login      { email, password }
  *   POST   /api/auth/logout     (klient kustutab tokeni ise)
  *   POST   /api/auth/password    { current_password, new_password }
+ *   PUT    /api/auth/me          { display_name }
  *   GET    /api/auth/me
  *
  *   GET    /api/settings
@@ -246,6 +247,19 @@ async function handleChangePassword(req, user, env) {
   // Hand back a fresh token so the device that made the change stays signed in.
   const token = await makeToken(user.id, user.email, requireSecret(env));
   return json({ ok: true, token });
+}
+
+// Update the account's own profile. Only display_name is editable — the
+// e-mail identifies the account, so changing it would need a verification
+// flow we don't have.
+async function handleUpdateMe(req, user, env) {
+  const body = await req.json().catch(() => ({}));
+  if (!('display_name' in body)) return json({ error: 'Midagi muuta pole' }, { status: 400 });
+  const name = (body.display_name == null ? '' : String(body.display_name)).trim();
+  if (name.length > 100) return json({ error: 'Nimi võib olla kuni 100 tähemärki' }, { status: 400 });
+
+  await env.DB.prepare('UPDATE users SET display_name = ? WHERE id = ?').bind(name || null, user.id).run();
+  return json({ ok: true, id: user.id, email: user.email, display_name: name || null, is_admin: user.is_admin === 1 });
 }
 
 async function handleMe(req, env) {
@@ -685,6 +699,7 @@ async function route(req, url, env) {
   if (!user) return json({ error: 'Pole sisse logitud' }, { status: 401 });
 
   if (path === '/api/auth/password' && method === 'POST') return handleChangePassword(req, user, env);
+  if (path === '/api/auth/me'       && method === 'PUT')  return handleUpdateMe(req, user, env);
 
   if (path === '/api/settings' && method === 'GET') return handleGetSettings(user, env);
   if (path === '/api/settings' && method === 'PUT') return handlePutSettings(req, user, env);
