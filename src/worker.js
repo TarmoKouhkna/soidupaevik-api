@@ -66,19 +66,22 @@ async function signJWT(payload, secret) {
   return `${data}.${b64url(sig)}`;
 }
 
+// A malformed token is an authentication failure, not a server error — every
+// decode step can throw on junk input (atob rejects invalid base64), so the
+// whole body is guarded and returns null, which the caller turns into a 401.
 async function verifyJWT(token, secret) {
-  const parts = token.split('.');
-  if (parts.length !== 3) return null;
-  const [header, body, sigB64] = parts;
-  const data = `${header}.${body}`;
-  const key = await crypto.subtle.importKey(
-    'raw', new TextEncoder().encode(secret),
-    { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']
-  );
-  const sigBytes = Uint8Array.from(b64urlDecode(sigB64), c => c.charCodeAt(0));
-  const valid = await crypto.subtle.verify('HMAC', key, sigBytes, new TextEncoder().encode(data));
-  if (!valid) return null;
   try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const [header, body, sigB64] = parts;
+    const data = `${header}.${body}`;
+    const key = await crypto.subtle.importKey(
+      'raw', new TextEncoder().encode(secret),
+      { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']
+    );
+    const sigBytes = Uint8Array.from(b64urlDecode(sigB64), c => c.charCodeAt(0));
+    const valid = await crypto.subtle.verify('HMAC', key, sigBytes, new TextEncoder().encode(data));
+    if (!valid) return null;
     const payload = JSON.parse(b64urlDecode(body));
     if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) return null;
     return payload;
@@ -171,34 +174,53 @@ async function getUserFromRequest(req, env) {
 // ============================================================
 // Auth handlers
 // ============================================================
+// Credentials arrive as untrusted JSON, so both fields are type-checked in one
+// place: a non-string password would slip past a length rule (`undefined < 8`
+// is false) and a non-string e-mail would throw inside toLowerCase, turning a
+// bad request into a 500.
+function parseCredentials(body, minPasswordLength = 1) {
+  const { email, password } = body;
+  if (typeof email !== 'string' || typeof password !== 'string') return { ok: false };
+  const emailLc = email.trim().toLowerCase();
+  if (!emailLc || password.length < minPasswordLength) return { ok: false };
+  return { ok: true, email: emailLc, password };
+}
+
+// Free-text field from an untrusted body — anything that isn't a string is
+// dropped rather than handed to D1, which rejects non-primitive binds.
+function parseOptionalText(v, maxLength = 100) {
+  if (typeof v !== 'string') return null;
+  return v.trim().slice(0, maxLength) || null;
+}
+
 async function handleRegister(req, env) {
   const body = await req.json().catch(() => ({}));
-  const { email, password, display_name } = body;
-  if (!email || !password || password.length < 8)
+  const cred = parseCredentials(body, 8);
+  if (!cred.ok)
     return json({ error: 'E-post ja vähemalt 8-tähemärgine parool nõutud' }, { status: 400 });
+  const { email: emailLc, password } = cred;
+  const displayName = parseOptionalText(body.display_name);
 
-  const emailLc = email.toLowerCase().trim();
   const existing = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(emailLc).first();
   if (existing) return json({ error: 'See e-post on juba kasutusel' }, { status: 409 });
 
   const hash = await hashPassword(password);
   const result = await env.DB.prepare(
     'INSERT INTO users (email, password_hash, display_name) VALUES (?, ?, ?)'
-  ).bind(emailLc, hash, display_name || null).run();
+  ).bind(emailLc, hash, displayName).run();
   const userId = result.meta.last_row_id;
 
   const secret = requireSecret(env);
   const token = await makeToken(userId, emailLc, secret);
 
-  return json({ token, id: userId, email: emailLc, display_name: display_name || null, is_admin: false });
+  return json({ token, id: userId, email: emailLc, display_name: displayName, is_admin: false });
 }
 
 async function handleLogin(req, env) {
   const body = await req.json().catch(() => ({}));
-  const { email, password } = body;
-  if (!email || !password) return json({ error: 'E-post ja parool nõutud' }, { status: 400 });
-
-  const emailLc = email.toLowerCase().trim();
+  const cred = parseCredentials(body);
+  if (!cred.ok) return json({ error: 'E-post ja parool nõutud' }, { status: 400 });
+  const { email: emailLc, password } = cred;
   const user = await env.DB.prepare(
     'SELECT id, email, password_hash, display_name, is_admin FROM users WHERE email = ?'
   ).bind(emailLc).first();
@@ -231,7 +253,8 @@ async function handleLogout() {
 async function handleChangePassword(req, user, env) {
   const body = await req.json().catch(() => ({}));
   const { current_password, new_password } = body;
-  if (!current_password || !new_password)
+  if (typeof current_password !== 'string' || typeof new_password !== 'string'
+      || !current_password || !new_password)
     return json({ error: 'Praegune ja uus parool nõutud' }, { status: 400 });
   if (new_password.length < 8)
     return json({ error: 'Uus parool peab olema vähemalt 8 tähemärki' }, { status: 400 });
@@ -255,11 +278,12 @@ async function handleChangePassword(req, user, env) {
 async function handleUpdateMe(req, user, env) {
   const body = await req.json().catch(() => ({}));
   if (!('display_name' in body)) return json({ error: 'Midagi muuta pole' }, { status: 400 });
-  const name = (body.display_name == null ? '' : String(body.display_name)).trim();
-  if (name.length > 100) return json({ error: 'Nimi võib olla kuni 100 tähemärki' }, { status: 400 });
+  if (typeof body.display_name === 'string' && body.display_name.trim().length > 100)
+    return json({ error: 'Nimi võib olla kuni 100 tähemärki' }, { status: 400 });
+  const name = parseOptionalText(body.display_name);
 
-  await env.DB.prepare('UPDATE users SET display_name = ? WHERE id = ?').bind(name || null, user.id).run();
-  return json({ ok: true, id: user.id, email: user.email, display_name: name || null, is_admin: user.is_admin === 1 });
+  await env.DB.prepare('UPDATE users SET display_name = ? WHERE id = ?').bind(name, user.id).run();
+  return json({ ok: true, id: user.id, email: user.email, display_name: name, is_admin: user.is_admin === 1 });
 }
 
 async function handleMe(req, env) {
@@ -286,6 +310,17 @@ async function handlePutSettings(req, user, env) {
   const body = await req.json().catch(() => ({}));
   const stmts = [];
   for (const [key, value] of Object.entries(body)) {
+    // A cleared field arrives as null or ''. Writing String(null) would persist
+    // the literal text "null" and show it as the user's name on every later
+    // report; dropping the row instead lets the client's own default apply.
+    if (value == null || value === '') {
+      stmts.push(env.DB.prepare(
+        'DELETE FROM settings WHERE user_id = ? AND key = ?'
+      ).bind(user.id, key));
+      continue;
+    }
+    if (typeof value === 'object')
+      return json({ error: `Seade ${key} peab olema tekst või arv` }, { status: 400 });
     stmts.push(env.DB.prepare(
       'INSERT INTO settings (user_id, key, value) VALUES (?, ?, ?) ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value'
     ).bind(user.id, key, String(value)));
@@ -362,12 +397,26 @@ async function handleUpdateReport(id, req, user, env) {
   const { year, month, mode, employee_name, plate, employer,
           prev_speedo, end_speedo, trip_distance, route, purpose, trips } = body;
 
+  if (!year || !month) return json({ error: 'Aasta ja kuu nõutud' }, { status: 400 });
+  if (mode !== undefined && mode !== 'simple' && mode !== 'detail')
+    return json({ error: 'Mode peab olema simple või detail' }, { status: 400 });
+
   const owned = await env.DB.prepare('SELECT id, mode, vehicle_id FROM reports WHERE id = ? AND user_id = ?').bind(id, user.id).first();
   if (!owned) return json({ error: 'Aruannet ei leitud' }, { status: 404 });
 
   // Keep the existing vehicle_id when the client omits it (older frontends).
   const vehicleId = body.vehicle_id !== undefined ? body.vehicle_id : owned.vehicle_id;
   const effectiveMode = mode || owned.mode || 'simple';
+
+  // Moving a report onto a (year, month, vehicle) slot that is already taken
+  // would hit the UNIQUE index and surface as a raw SQL 500, so answer the same
+  // 409 + existing_id the create path uses and let the client open that report.
+  const clash = await env.DB.prepare(
+    'SELECT id FROM reports WHERE user_id = ? AND year = ? AND month = ? AND vehicle_id IS ? AND id != ?'
+  ).bind(user.id, year, month, vehicleId, id).first();
+  if (clash)
+    return json({ error: 'Selle kuu aruanne on juba olemas', existing_id: clash.id }, { status: 409 });
+
   // Re-snapshot the fuel price on save (a save reflects the price at that time).
   const fuelPrice = await resolveFuelPriceForVehicle(vehicleId, user, env);
   await env.DB.prepare(
@@ -381,7 +430,9 @@ async function handleUpdateReport(id, req, user, env) {
     await env.DB.prepare('DELETE FROM trips WHERE report_id = ?').bind(id).run();
     if (trips.length) await insertTrips(env, id, effectiveMode, trips, year, month);
   }
-  return json({ ok: true });
+  // Tell the client how many trips were kept, so it can flag a silent drop.
+  const saved = await env.DB.prepare('SELECT COUNT(*) AS n FROM trips WHERE report_id = ?').bind(id).first();
+  return json({ ok: true, trip_count: saved ? saved.n : 0 });
 }
 
 // A monthly report may only hold that month's trips. The client prunes dates
@@ -427,9 +478,12 @@ async function handleDeleteReport(id, user, env) {
 // ============================================================
 // Resolve the user's default vehicle id (for backwards-compat when the
 // client does not send a vehicle_id). Falls back to any vehicle the user has.
+// An active vehicle always wins over an archived one, even when the archived
+// row still carries the default flag — filing a new report against a car the
+// user has retired is worse than ignoring the flag.
 async function resolveDefaultVehicleId(user, env) {
   const def = await env.DB.prepare(
-    'SELECT id FROM vehicles WHERE user_id = ? ORDER BY is_default DESC, archived ASC, id ASC LIMIT 1'
+    'SELECT id FROM vehicles WHERE user_id = ? ORDER BY archived ASC, is_default DESC, id ASC LIMIT 1'
   ).bind(user.id).first();
   return def ? def.id : null;
 }
@@ -513,11 +567,14 @@ async function handleUpdateVehicle(id, req, user, env) {
   const fc = fcPresent ? parseConsumption(body.fuel_consumption) : { ok: true, value: null };
   if (!fc.ok) return json({ error: 'Vigane kütusekulu (L/100km)' }, { status: 400 });
 
+  // Archiving always clears the default flag (hence it is tested before the
+  // is_default request): an archived car must never stay the default, or every
+  // fallback that reads the flag would file new reports against a retired car.
   await env.DB.prepare(
     `UPDATE vehicles SET
        plate            = COALESCE(?, plate),
        label            = CASE WHEN ? THEN ? ELSE label END,
-       is_default       = CASE WHEN ? THEN 1 ELSE is_default END,
+       is_default       = CASE WHEN ? THEN 0 WHEN ? THEN 1 ELSE is_default END,
        archived         = CASE WHEN ? THEN ? ELSE archived END,
        fuel_type        = CASE WHEN ? THEN ? ELSE fuel_type END,
        fuel_consumption = CASE WHEN ? THEN ? ELSE fuel_consumption END
@@ -525,12 +582,26 @@ async function handleUpdateVehicle(id, req, user, env) {
   ).bind(
     plate,
     body.label !== undefined ? 1 : 0, body.label != null ? String(body.label).trim() || null : null,
+    body.archived ? 1 : 0,
     body.is_default ? 1 : 0,
     body.archived !== undefined ? 1 : 0, body.archived ? 1 : 0,
     ftPresent ? 1 : 0, ft.value,
     fcPresent ? 1 : 0, fc.value,
     id
   ).run();
+
+  // Archiving the default leaves the account with none — hand it to the oldest
+  // active car so the next "+ Uus kuu" still pre-selects something sensible.
+  const hasDefault = await env.DB.prepare(
+    'SELECT id FROM vehicles WHERE user_id = ? AND is_default = 1 AND archived = 0'
+  ).bind(user.id).first();
+  if (!hasDefault) {
+    await env.DB.prepare(
+      `UPDATE vehicles SET is_default = 1 WHERE id = (
+         SELECT id FROM vehicles WHERE user_id = ? AND archived = 0 ORDER BY id ASC LIMIT 1
+       )`
+    ).bind(user.id).run();
+  }
   return json({ ok: true });
 }
 
