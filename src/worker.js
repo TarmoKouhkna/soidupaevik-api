@@ -9,6 +9,7 @@
  *   POST   /api/auth/register   { email, password, display_name? }
  *   POST   /api/auth/login      { email, password }
  *   POST   /api/auth/logout     (klient kustutab tokeni ise)
+ *   POST   /api/auth/password    { current_password, new_password }
  *   GET    /api/auth/me
  *
  *   GET    /api/settings
@@ -223,6 +224,30 @@ async function handleLogout() {
   return json({ ok: true });
 }
 
+// Change own password. Requires the current one, so a token alone can't lock
+// the owner out of the account. Tokens are stateless: sessions already issued
+// to other devices keep working until they expire — only the password changes.
+async function handleChangePassword(req, user, env) {
+  const body = await req.json().catch(() => ({}));
+  const { current_password, new_password } = body;
+  if (!current_password || !new_password)
+    return json({ error: 'Praegune ja uus parool nõutud' }, { status: 400 });
+  if (new_password.length < 8)
+    return json({ error: 'Uus parool peab olema vähemalt 8 tähemärki' }, { status: 400 });
+
+  const row = await env.DB.prepare('SELECT password_hash FROM users WHERE id = ?').bind(user.id).first();
+  if (!row) return json({ error: 'Kasutajat ei leitud' }, { status: 404 });
+  if (!(await verifyPassword(current_password, row.password_hash)))
+    return json({ error: 'Praegune parool on vale' }, { status: 403 });
+
+  await env.DB.prepare('UPDATE users SET password_hash = ? WHERE id = ?')
+    .bind(await hashPassword(new_password), user.id).run();
+
+  // Hand back a fresh token so the device that made the change stays signed in.
+  const token = await makeToken(user.id, user.email, requireSecret(env));
+  return json({ ok: true, token });
+}
+
 async function handleMe(req, env) {
   const user = await getUserFromRequest(req, env);
   if (!user) return json({ error: 'Pole sisse logitud' }, { status: 401 });
@@ -314,7 +339,7 @@ async function handleCreateReport(req, user, env) {
          prev_speedo || 0, end_speedo || 0, trip_distance || 100, route || null, purpose || null, fuelPrice).run();
   const reportId = result.meta.last_row_id;
 
-  if (Array.isArray(trips) && trips.length) await insertTrips(env, reportId, mode, trips);
+  if (Array.isArray(trips) && trips.length) await insertTrips(env, reportId, mode, trips, year, month);
   return json({ id: reportId });
 }
 
@@ -340,12 +365,27 @@ async function handleUpdateReport(id, req, user, env) {
 
   if (Array.isArray(trips)) {
     await env.DB.prepare('DELETE FROM trips WHERE report_id = ?').bind(id).run();
-    if (trips.length) await insertTrips(env, id, effectiveMode, trips);
+    if (trips.length) await insertTrips(env, id, effectiveMode, trips, year, month);
   }
   return json({ ok: true });
 }
 
-async function insertTrips(env, reportId, mode, trips) {
+// A monthly report may only hold that month's trips. The client prunes dates
+// that fall outside the report month, but filter here too so a stale client (or
+// a report whose month was switched after the days were picked) can't write
+// another month's trips into this one.
+function tripsInMonth(trips, mode, year, month) {
+  if (!year || !month) return trips;
+  const prefix = `${year}-${String(month).padStart(2, '0')}-`;
+  return trips.filter(t => {
+    const date = mode === 'detail' ? (t && t.date) : t;
+    return typeof date === 'string' && date.startsWith(prefix);
+  });
+}
+
+async function insertTrips(env, reportId, mode, trips, year, month) {
+  trips = tripsInMonth(trips, mode, year, month);
+  if (!trips.length) return;
   if (mode === 'detail') {
     const stmts = trips.map(t => env.DB.prepare(
       `INSERT INTO trips (report_id, date, route, km, plate, odom_start, odom_end, trip_type, notes)
@@ -643,6 +683,8 @@ async function route(req, url, env) {
   // All other endpoints require JWT
   const user = await getUserFromRequest(req, env);
   if (!user) return json({ error: 'Pole sisse logitud' }, { status: 401 });
+
+  if (path === '/api/auth/password' && method === 'POST') return handleChangePassword(req, user, env);
 
   if (path === '/api/settings' && method === 'GET') return handleGetSettings(user, env);
   if (path === '/api/settings' && method === 'PUT') return handlePutSettings(req, user, env);
