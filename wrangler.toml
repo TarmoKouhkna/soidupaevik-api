@@ -15,4 +15,12 @@ crons = ["0 6 * * *"]
 # Frontend origin for CORS. Matches the live site. JWT_SECRET is configured in
 # the Cloudflare dashboard (not here) — always deploy with `--keep-vars` so it
 # is preserved and existing user sessions are not invalidated.
+# RESEND_API_KEY (password reset mails) is a secret too: `wrangler secret put`.
+# Origin is also the base of the reset link mailed to users.
 ALLOWED_ORIGIN = "https://soidud.org"
+
+# Workers Logs: console.error from ctx.waitUntil work (e.g. a failed reset
+# mail — forgot-password always answers 200, so the log is the only place a
+# send failure shows up) is visible in the dashboard under Observability.
+[observability]
+enabled = true
