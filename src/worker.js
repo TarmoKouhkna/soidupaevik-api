@@ -10,6 +10,8 @@
  *   POST   /api/auth/login      { email, password }
  *   POST   /api/auth/logout     (klient kustutab tokeni ise)
  *   POST   /api/auth/password    { current_password, new_password }
+ *   POST   /api/auth/forgot-password { email }            (public, always 200)
+ *   POST   /api/auth/reset-password  { token, new_password } (public)
  *   PUT    /api/auth/me          { display_name }
  *   GET    /api/auth/me
  *
@@ -38,6 +40,11 @@
  */
 
 const JWT_EXPIRY_DAYS = 30;
+
+// Password reset by e-mail
+const RESET_TTL_MINUTES = 60;
+const RESET_MAX_PER_HOUR = 3;   // per account — caps how often anyone can mail a victim
+const RESET_FROM = 'Sõidupäevik <noreply@soidud.org>';
 
 // ============================================================
 // JWT (HS256, Web Crypto)
@@ -90,9 +97,12 @@ async function verifyJWT(token, secret) {
   }
 }
 
+// iat lets getUserFromRequest reject tokens issued before the last password
+// change. Tokens minted before iat existed have none and count as issued at 0.
 function makeToken(userId, email, secret) {
-  const exp = Math.floor(Date.now() / 1000) + JWT_EXPIRY_DAYS * 86400;
-  return signJWT({ sub: userId, email, exp }, secret);
+  const iat = Math.floor(Date.now() / 1000);
+  const exp = iat + JWT_EXPIRY_DAYS * 86400;
+  return signJWT({ sub: userId, email, iat, exp }, secret);
 }
 
 // JWT_SECRET must be configured (wrangler secret). Never fall back to a known
@@ -166,9 +176,14 @@ async function getUserFromRequest(req, env) {
   const payload = await verifyJWT(token, secret);
   if (!payload || !payload.sub) return null;
   const user = await env.DB.prepare(
-    'SELECT id, email, display_name, is_admin FROM users WHERE id = ?'
+    'SELECT id, email, display_name, is_admin, password_changed_at FROM users WHERE id = ?'
   ).bind(payload.sub).first();
-  return user || null;
+  if (!user) return null;
+  // A password change or reset signs every other device out: the token has to
+  // be at least as new as the password. Same-second comparison is deliberate —
+  // the token handed back by the change itself carries that very second.
+  if (user.password_changed_at && (payload.iat || 0) < user.password_changed_at) return null;
+  return user;
 }
 
 // ============================================================
@@ -248,8 +263,8 @@ async function handleLogout() {
 }
 
 // Change own password. Requires the current one, so a token alone can't lock
-// the owner out of the account. Tokens are stateless: sessions already issued
-// to other devices keep working until they expire — only the password changes.
+// the owner out of the account. Setting password_changed_at signs out every
+// other device (see getUserFromRequest); this one gets a fresh token back.
 async function handleChangePassword(req, user, env) {
   const body = await req.json().catch(() => ({}));
   const { current_password, new_password } = body;
@@ -264,12 +279,169 @@ async function handleChangePassword(req, user, env) {
   if (!(await verifyPassword(current_password, row.password_hash)))
     return json({ error: 'Praegune parool on vale' }, { status: 403 });
 
-  await env.DB.prepare('UPDATE users SET password_hash = ? WHERE id = ?')
-    .bind(await hashPassword(new_password), user.id).run();
+  await env.DB.prepare('UPDATE users SET password_hash = ?, password_changed_at = ? WHERE id = ?')
+    .bind(await hashPassword(new_password), Math.floor(Date.now() / 1000), user.id).run();
 
   // Hand back a fresh token so the device that made the change stays signed in.
   const token = await makeToken(user.id, user.email, requireSecret(env));
   return json({ ok: true, token });
+}
+
+// ============================================================
+// Password reset by e-mail
+// ============================================================
+function randomToken() {
+  return b64url(crypto.getRandomValues(new Uint8Array(32)));
+}
+
+async function sha256Hex(str) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Transactional mail goes through Resend's HTTP API (free tier: 3000/month,
+// 100/day). RESEND_API_KEY is a Worker secret (`wrangler secret put`), and
+// soidud.org must be verified in Resend for the From address to be accepted.
+// A failure throws, so the caller's log shows the status and Resend's reason.
+async function sendMail(env, { to, subject, text, html }) {
+  if (!env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is not configured');
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ from: RESET_FROM, to: [to], subject, text, html }),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '');
+    throw new Error(`Resend ${res.status}: ${detail.slice(0, 300)}`);
+  }
+}
+
+// The link has to open the frontend, whose origin is exactly what CORS is
+// locked to — so a local test setup (ALLOWED_ORIGIN = http://localhost:…)
+// automatically mails local links too.
+function appUrl(env) {
+  const o = env.ALLOWED_ORIGIN;
+  return o && o !== '*' ? o.replace(/\/$/, '') : 'https://soidud.org';
+}
+
+// Always answers the same way, fast, whether or not the address has an account:
+// a different status or a slower response would tell anyone which e-mails are
+// registered. The lookup, the token and the mail all run after the response.
+async function handleForgotPassword(req, env, ctx) {
+  const body = await req.json().catch(() => ({}));
+  if (typeof body.email !== 'string' || !body.email.trim())
+    return json({ error: 'E-post nõutud' }, { status: 400 });
+  const emailLc = body.email.trim().toLowerCase();
+
+  ctx.waitUntil(issuePasswordReset(env, emailLc)
+    .catch(e => console.error('issuePasswordReset:', e.message)));
+  return json({ ok: true });
+}
+
+async function issuePasswordReset(env, emailLc) {
+  const now = Math.floor(Date.now() / 1000);
+  // Housekeeping: links a day past their expiry are of no use to anyone.
+  await env.DB.prepare('DELETE FROM password_resets WHERE expires_at < ?').bind(now - 86400).run();
+
+  const user = await env.DB.prepare('SELECT id, email FROM users WHERE email = ?').bind(emailLc).first();
+  if (!user) return;
+
+  const recent = await env.DB.prepare(
+    'SELECT COUNT(*) AS n FROM password_resets WHERE user_id = ? AND created_at > ?'
+  ).bind(user.id, now - 3600).first();
+  if (recent && recent.n >= RESET_MAX_PER_HOUR) {
+    console.warn('password reset rate limit hit for user', user.id);
+    return;
+  }
+
+  // Only the hash is stored; the raw token exists in the e-mail and nowhere else.
+  const token = randomToken();
+  await env.DB.prepare(
+    'INSERT INTO password_resets (user_id, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?)'
+  ).bind(user.id, await sha256Hex(token), now, now + RESET_TTL_MINUTES * 60).run();
+
+  // Query string, not a path: the frontend is one index.html and must not need
+  // a server rewrite for this. Read once on load, then stripped from the URL.
+  const link = `${appUrl(env)}/?taasta=${token}`;
+  // Registration never validated the address format, so it goes into the HTML escaped.
+  const emailHtml = user.email.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
+  await sendMail(env, {
+    to: user.email,
+    subject: 'Sõidupäeviku parooli taastamine',
+    text:
+`Tere!
+
+Keegi (loodetavasti sina) palus Sõidupäeviku konto ${user.email} parooli taastada.
+Uue parooli saad määrata selle lingi kaudu:
+
+${link}
+
+Link kehtib ${RESET_TTL_MINUTES} minutit ja töötab ühe korra. Pärast parooli
+vahetust logitakse konto kõigis teistes seadmetes välja.
+
+Kui sina seda ei palunud, ei pea sa midagi tegema — parool jääb samaks.
+
+Sõidupäevik · soidud.org`,
+    html:
+`<p>Tere!</p>
+<p>Keegi (loodetavasti sina) palus Sõidupäeviku konto <strong>${emailHtml}</strong> parooli taastada.</p>
+<p><a href="${link}" style="display:inline-block;padding:10px 18px;background:#1f4e79;color:#fff;text-decoration:none;border-radius:6px;">Määra uus parool</a></p>
+<p style="font-size:13px;color:#555;">Kui nupp ei tööta, ava see aadress:<br><a href="${link}">${link}</a></p>
+<p style="font-size:13px;color:#555;">Link kehtib ${RESET_TTL_MINUTES} minutit ja töötab ühe korra. Pärast parooli vahetust logitakse konto kõigis teistes seadmetes välja.</p>
+<p style="font-size:13px;color:#555;">Kui sina seda ei palunud, ei pea sa midagi tegema — parool jääb samaks.</p>
+<p style="font-size:13px;color:#888;">Sõidupäevik · soidud.org</p>`,
+  });
+}
+
+// Spends the link and signs the user in on this device; every other device is
+// signed out by password_changed_at. A link, once used, is dead — and so are
+// all other outstanding links for the account.
+async function handleResetPassword(req, env) {
+  const body = await req.json().catch(() => ({}));
+  const { token, new_password } = body;
+  if (typeof token !== 'string' || !token || typeof new_password !== 'string')
+    return json({ error: 'Taastamislink ja uus parool nõutud' }, { status: 400 });
+  if (new_password.length < 8)
+    return json({ error: 'Uus parool peab olema vähemalt 8 tähemärki' }, { status: 400 });
+
+  const now = Math.floor(Date.now() / 1000);
+  const reset = await env.DB.prepare(
+    'SELECT id, user_id FROM password_resets WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?'
+  ).bind(await sha256Hex(token), now).first();
+  if (!reset)
+    return json({ error: 'Taastamislink on aegunud või juba kasutatud. Telli uus.' }, { status: 400 });
+
+  // Claim the link before touching the password, so two parallel submits of
+  // the same link can't both succeed.
+  const claim = await env.DB.prepare(
+    'UPDATE password_resets SET used_at = ? WHERE id = ? AND used_at IS NULL'
+  ).bind(now, reset.id).run();
+  if (!claim.meta || claim.meta.changes !== 1)
+    return json({ error: 'Taastamislink on aegunud või juba kasutatud. Telli uus.' }, { status: 400 });
+
+  const hash = await hashPassword(new_password);
+  await env.DB.batch([
+    env.DB.prepare("UPDATE users SET password_hash = ?, password_changed_at = ?, last_login_at = datetime('now') WHERE id = ?")
+      .bind(hash, now, reset.user_id),
+    env.DB.prepare('UPDATE password_resets SET used_at = ? WHERE user_id = ? AND used_at IS NULL')
+      .bind(now, reset.user_id),
+  ]);
+
+  const user = await env.DB.prepare(
+    'SELECT id, email, display_name, is_admin FROM users WHERE id = ?'
+  ).bind(reset.user_id).first();
+  if (!user) return json({ error: 'Kasutajat ei leitud' }, { status: 404 });
+
+  const jwt = await makeToken(user.id, user.email, requireSecret(env));
+  return json({
+    token: jwt,
+    id: user.id, email: user.email,
+    display_name: user.display_name,
+    is_admin: user.is_admin === 1,
+  });
 }
 
 // Update the account's own profile. Only display_name is editable — the
@@ -724,7 +896,7 @@ async function refreshFuelPrices(env) {
 // Router
 // ============================================================
 export default {
-  async fetch(req, env) {
+  async fetch(req, env, ctx) {
     const url = new URL(req.url);
     const origin = env.ALLOWED_ORIGIN || '*';
 
@@ -733,7 +905,7 @@ export default {
 
     let response;
     try {
-      response = await route(req, url, env);
+      response = await route(req, url, env, ctx);
     } catch (e) {
       console.error('Worker error:', e);
       response = json({ error: 'Serveri viga: ' + e.message }, { status: 500 });
@@ -749,7 +921,7 @@ export default {
   },
 };
 
-async function route(req, url, env) {
+async function route(req, url, env, ctx) {
   const path = url.pathname;
   const method = req.method;
 
@@ -761,6 +933,8 @@ async function route(req, url, env) {
   if (path === '/api/auth/login'    && method === 'POST') return handleLogin(req, env);
   if (path === '/api/auth/logout'   && method === 'POST') return handleLogout();
   if (path === '/api/auth/me'       && method === 'GET')  return handleMe(req, env);
+  if (path === '/api/auth/forgot-password' && method === 'POST') return handleForgotPassword(req, env, ctx);
+  if (path === '/api/auth/reset-password'  && method === 'POST') return handleResetPassword(req, env);
 
   // Public: current Estonia fuel prices (info badge, visible logged-out too)
   if (path === '/api/fuel-prices' && method === 'GET') return handleGetFuelPrices(env);

@@ -2,9 +2,9 @@
 /**
  * Reset an account's password by hand.
  *
- * There is no e-mail reset flow, so when a user has forgotten their password
- * and has no device left that is still signed in, the only way back in is to
- * write a new hash into the database. This prints one in exactly the format
+ * Fallback for when the e-mail reset flow (/api/auth/forgot-password) can't
+ * help — the mail doesn't arrive, or the account's address is dead. Writing a
+ * new hash into the database is then the way back in. This prints one in exactly the format
  * src/worker.js stores (PBKDF2-SHA256, 100k iterations, random 16-byte salt),
  * plus the UPDATE statement to run.
  *
